@@ -1,0 +1,250 @@
+#Patches Coef Ramp
+
+Filter coefficients should not jump.  When a cutoff knob moves, slamming
+the new coefficient into the recurrence on the next sample produces a
+click — "zipper noise".  The cure is to *ramp*: spread the change across
+the samples until the next control update, so the coefficient slides
+rather than steps.
+
+Every filter kernel in the library — biquad, SVF, ladder — needs the same
+ramp bookkeeping, so it lives here as a reusable primitive.  The pattern
+is: on a control update, snap the active value to the previous target
+(discarding any drift), store the new target, and compute a per-sample
+delta; then add that delta once per sample until the next update.
+
+Two structs per arity split the data by access temperature.  The `active`
+and `delta` fields are read and written *every sample*, so they are
+"hot"; the `target` field is touched only at control-rate update
+boundaries, so it is "cold".  Kernels place the hot struct beside their
+filter state and the cold struct after it, keeping the per-sample working
+set inside as few cache lines as possible.  Nothing here dictates layout
+— the kernel keeps control.
+
+##Scalar ramp
+
+The `K` type parameter is the coefficient count (a biquad has five, the
+SVF two).  #CoefRamp holds the hot pair; #CoefTargets holds the cold
+target.
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct CoefRamp<const K: usize> {
+        pub active: [f32; K],
+        pub delta: [f32; K],
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct CoefTargets<const K: usize> {
+        pub target: [f32; K],
+    }
+
+    impl<const K: usize> CoefRamp<K> {
+        #[inline]
+        pub const fn new(values: [f32; K]) -> Self {
+            Self { active: values, delta: [0.0; K] }
+        }
+
+        pub fn set_static(&mut self, values: [f32; K]) {
+            self.active = values;
+            self.delta = [0.0; K];
+        }
+
+        #[inline]
+        pub fn begin_ramp(
+            &mut self,
+            new_targets: [f32; K],
+            targets: &mut CoefTargets<K>,
+            interval_recip: f32,
+        ) {
+            self.active = targets.target;
+            targets.target = new_targets;
+            for k in 0..K {
+                self.delta[k] = (new_targets[k] - self.active[k]) * interval_recip;
+            }
+        }
+
+        #[inline]
+        pub fn advance(&mut self) {
+            for k in 0..K {
+                self.active[k] += self.delta[k];
+            }
+        }
+    }
+
+    impl<const K: usize> CoefTargets<K> {
+        #[inline]
+        pub const fn new(values: [f32; K]) -> Self {
+            Self { target: values }
+        }
+    }
+
+A `begin_ramp` stores the new target and sets each delta to the gap
+divided by the update interval; `advance` walks the active value toward
+the target one delta-step at a time, reaching it after exactly that many
+samples.
+
+~example
+    { let mut r = CoefRamp::<3>::new([0.0; 3]); let mut t = CoefTargets::<3>::new([0.0; 3]); r.begin_ramp([1.0, 2.0, -1.0], &mut t, 1.0 / 8.0); (r.delta[0] - 0.125).abs() < 1e-6 && (r.delta[1] - 0.25).abs() < 1e-6 }
+    { let mut r = CoefRamp::<2>::new([0.0; 2]); let mut t = CoefTargets::<2>::new([0.0; 2]); r.begin_ramp([1.0, 2.0], &mut t, 1.0 / 16.0); for _ in 0..16 { r.advance(); } (r.active[0] - 1.0).abs() < 1e-4 && (r.active[1] - 2.0).abs() < 1e-4 }
+
+There is deliberately no "ramp finished" counter.  Drift is handled at the
+*start* of the next update: `begin_ramp` re-bases `active` off the stored
+target, not off the possibly-overshot current value.  A second ramp
+therefore snaps cleanly to where the first one was headed.
+
+~property snap-on-begin
+    proptest! {
+        fn second_ramp_snaps_to_stored_target(
+            t1 in -5.0f32..5.0,
+            t2 in -5.0f32..5.0,
+        ) {
+            let mut r = CoefRamp::<1>::new([0.0]);
+            let mut tg = CoefTargets::<1>::new([0.0]);
+            r.begin_ramp([t1], &mut tg, 1.0 / 8.0);
+            r.advance();
+            r.advance();
+            r.begin_ramp([t2], &mut tg, 1.0 / 8.0);
+            prop_assert!((r.active[0] - t1).abs() < 1e-6);
+            prop_assert!((tg.target[0] - t2).abs() < 1e-6);
+        }
+    }
+
+Whatever interval is chosen, advancing for exactly that many samples
+lands the active value on the target.
+
+~property advance-reaches-target
+    proptest! {
+        fn reaches(target in -10.0f32..10.0, steps in 1u32..256) {
+            let mut r = CoefRamp::<1>::new([0.0]);
+            let mut t = CoefTargets::<1>::new([0.0]);
+            r.begin_ramp([target], &mut t, 1.0 / steps as f32);
+            for _ in 0..steps {
+                r.advance();
+            }
+            prop_assert!((r.active[0] - target).abs() < 1e-2);
+        }
+    }
+
+##Polyphonic ramp
+
+A polyphonic kernel runs `N` voices at once.  #PolyCoefRamp stores
+`[[f32; N]; K]` — for each of the `K` coefficients, a contiguous
+`[f32; N]` array of per-voice values (structure-of-arrays).  The
+per-sample `advance` is a nested loop whose inner pass over the `N`
+contiguous voices is what the compiler auto-vectorises; the outer pass
+over `K` unrolls at compile time.
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct PolyCoefRamp<const K: usize, const N: usize> {
+        pub active: [[f32; N]; K],
+        pub delta: [[f32; N]; K],
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct PolyCoefTargets<const K: usize, const N: usize> {
+        pub target: [[f32; N]; K],
+    }
+
+    impl<const K: usize, const N: usize> PolyCoefRamp<K, N> {
+        pub fn new_static(values: [f32; K]) -> Self {
+            let mut active = [[0.0; N]; K];
+            for (slot, v) in active.iter_mut().zip(values.iter()) {
+                *slot = [*v; N];
+            }
+            Self { active, delta: [[0.0; N]; K] }
+        }
+
+        pub fn set_static(&mut self, values: [f32; K]) {
+            for (slot, v) in self.active.iter_mut().zip(values.iter()) {
+                *slot = [*v; N];
+            }
+            for slot in self.delta.iter_mut() {
+                *slot = [0.0; N];
+            }
+        }
+
+        #[inline]
+        pub fn set_static_voice(&mut self, i: usize, values: [f32; K]) {
+            for (k, &v) in values.iter().enumerate() {
+                self.active[k][i] = v;
+                self.delta[k][i] = 0.0;
+            }
+        }
+
+        #[inline]
+        pub fn begin_ramp_voice(
+            &mut self,
+            i: usize,
+            new_targets: [f32; K],
+            targets: &mut PolyCoefTargets<K, N>,
+            interval_recip: f32,
+        ) {
+            for k in 0..K {
+                self.active[k][i] = targets.target[k][i];
+                targets.target[k][i] = new_targets[k];
+                self.delta[k][i] =
+                    (new_targets[k] - self.active[k][i]) * interval_recip;
+            }
+        }
+
+        #[inline]
+        pub fn advance(&mut self) {
+            for k in 0..K {
+                for i in 0..N {
+                    self.active[k][i] += self.delta[k][i];
+                }
+            }
+        }
+    }
+
+    impl<const K: usize, const N: usize> PolyCoefTargets<K, N> {
+        pub fn new_static(values: [f32; K]) -> Self {
+            let mut target = [[0.0; N]; K];
+            for (slot, v) in target.iter_mut().zip(values.iter()) {
+                *slot = [*v; N];
+            }
+            Self { target }
+        }
+    }
+
+~example
+    { let r = PolyCoefRamp::<2, 4>::new_static([1.0, 2.0]); r.active[0] == [1.0; 4] && r.active[1] == [2.0; 4] }
+    { let mut r = PolyCoefRamp::<2, 4>::new_static([0.0, 0.0]); let mut t = PolyCoefTargets::<2, 4>::new_static([0.0, 0.0]); r.begin_ramp_voice(0, [1.0, 0.0], &mut t, 1.0 / 8.0); r.begin_ramp_voice(2, [0.0, 2.0], &mut t, 1.0 / 8.0); t.target[0] == [1.0, 0.0, 0.0, 0.0] && t.target[1] == [0.0, 0.0, 2.0, 0.0] }
+
+Ramps are per-voice independent: starting a ramp on one voice leaves every
+other voice's coefficients exactly where they were.
+
+~property voice-independence
+    proptest! {
+        fn ramping_one_voice_leaves_others(
+            t0 in -5.0f32..5.0,
+            t1 in -5.0f32..5.0,
+        ) {
+            let mut r = PolyCoefRamp::<1, 4>::new_static([7.0]);
+            let mut tg = PolyCoefTargets::<1, 4>::new_static([7.0]);
+            r.begin_ramp_voice(1, [t0], &mut tg, 1.0 / 8.0);
+            r.begin_ramp_voice(2, [t1], &mut tg, 1.0 / 8.0);
+            prop_assert_eq!(r.active[0][0], 7.0);
+            prop_assert_eq!(r.active[0][3], 7.0);
+            prop_assert_eq!(tg.target[0][0], 7.0);
+        }
+    }
+
+---
+
+#Tests
+
+##scalar begin_ramp computes delta
+    { let mut r = CoefRamp::<3>::new([0.0; 3]); let mut t = CoefTargets::<3>::new([0.0; 3]); r.begin_ramp([1.0, 2.0, -1.0], &mut t, 1.0 / 8.0); r.active == [0.0; 3] && t.target == [1.0, 2.0, -1.0] }
+    { let mut r = CoefRamp::<3>::new([0.0; 3]); let mut t = CoefTargets::<3>::new([0.0; 3]); r.begin_ramp([1.0, 2.0, -1.0], &mut t, 1.0 / 8.0); (r.delta[2] - (-0.125)).abs() < 1e-6 }
+
+##scalar set_static zeroes delta
+    { let mut r = CoefRamp::<2>::new([0.0; 2]); let mut t = CoefTargets::<2>::new([0.0; 2]); r.begin_ramp([1.0, 2.0], &mut t, 1.0 / 8.0); r.set_static([5.0, 6.0]); r.active == [5.0, 6.0] && r.delta == [0.0; 2] }
+
+##scalar second ramp snaps to previous target
+    { let mut r = CoefRamp::<1>::new([0.0]); let mut t = CoefTargets::<1>::new([0.0]); r.begin_ramp([1.0], &mut t, 1.0 / 8.0); for _ in 0..4 { r.advance(); } r.begin_ramp([2.0], &mut t, 1.0 / 8.0); r.active[0] == 1.0 && t.target[0] == 2.0 }
+
+##poly advance reaches per-voice targets
+    { let mut r = PolyCoefRamp::<1, 16>::new_static([0.0]); let mut t = PolyCoefTargets::<1, 16>::new_static([0.0]); for i in 0..16 { r.begin_ramp_voice(i, [i as f32], &mut t, 1.0 / 32.0); } for _ in 0..32 { r.advance(); } (0..16).all(|i| (r.active[0][i] - i as f32).abs() < 1e-3) }
+
+##poly set_static zeroes all deltas
+    { let mut r = PolyCoefRamp::<2, 4>::new_static([0.0, 0.0]); let mut t = PolyCoefTargets::<2, 4>::new_static([0.0, 0.0]); r.begin_ramp_voice(0, [1.0, 2.0], &mut t, 1.0 / 8.0); r.set_static([5.0, 6.0]); r.active[0] == [5.0; 4] && r.active[1] == [6.0; 4] && r.delta[0] == [0.0; 4] }
