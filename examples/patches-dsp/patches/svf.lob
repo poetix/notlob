@@ -16,10 +16,12 @@ bp = bp + f * hp          (bandpass integrator)
 coefficient that *falls* as resonance rises.  Two integrators, fed back
 through the highpass node, realise a second-order resonant filter.
 
-This module presents the kernel in its static form — fixed coefficients
-per note.  Production use layers per-sample coefficient interpolation on
-top (smooth CV modulation without zipper noise); that ramping is an
-orthogonal concern and is omitted here so the filter itself is in view.
+Cutoff and resonance are not fixed — they are modulated, by envelopes,
+LFOs, and the player's hands.  To move a coefficient without zipper
+noise the kernel ramps it across the control interval, using the
+per-sample interpolation primitive from #Patches Coef Ramp.  Both the
+single-voice kernel below and the polyphonic kernel that closes the
+module are built on that primitive.
 
 ##Coefficients
 
@@ -143,26 +145,42 @@ two-word integrator memory.
         }
     }
 
-The #SvfKernel type binds coefficients and state.  Construction runs the
-coefficients through `stability_clamp` once; each `tick` then evaluates
-the three-line recurrence and returns `(lp, hp, bp)`.
+The #SvfKernel type binds the ramping coefficients to the integrator
+state and a cold target array.  The coefficients live in a `CoefRamp<2>`
+from #Patches Coef Ramp, indexed `F` for frequency and `Q` for damping.
+`new_static` and `set_static` install fixed coefficients with zero
+deltas; `tick` evaluates the three-line recurrence, advances the
+coefficients by one delta-step, and returns `(lp, hp, bp)`.
+
+    const F: usize = 0;
+    const Q: usize = 1;
 
     pub struct SvfKernel {
-        pub coeffs: SvfCoeffs,
+        pub coefs: CoefRamp<2>,
         pub state: SvfState,
+        pub targets: CoefTargets<2>,
     }
 
     impl SvfKernel {
         pub fn new_static(f: f32, d: f32) -> Self {
             let f = stability_clamp(f, d);
+            let values = [f, d];
             Self {
-                coeffs: SvfCoeffs { f, q_damp: d },
+                coefs: CoefRamp::new(values),
                 state: SvfState::default(),
+                targets: CoefTargets::new(values),
             }
         }
 
         pub fn from_coeffs(c: SvfCoeffs) -> Self {
             Self::new_static(c.f, c.q_damp)
+        }
+
+        pub fn set_static(&mut self, f: f32, d: f32) {
+            let f = stability_clamp(f, d);
+            let values = [f, d];
+            self.coefs.set_static(values);
+            self.targets.target = values;
         }
 
         pub fn reset_state(&mut self) {
@@ -171,14 +189,35 @@ the three-line recurrence and returns `(lp, hp, bp)`.
 
         #[inline]
         pub fn tick(&mut self, x: f32) -> (f32, f32, f32) {
-            let f = self.coeffs.f;
-            let q = self.coeffs.q_damp;
+            let f = self.coefs.active[F];
+            let q = self.coefs.active[Q];
             let lp = self.state.lp + f * self.state.bp;
             let hp = x - lp - q * self.state.bp;
             let bp = self.state.bp + f * hp;
             self.state.lp = sanitize(lp);
             self.state.bp = sanitize(bp);
+            self.coefs.advance();
             (lp, hp, bp)
+        }
+    }
+
+Starting a ramp is the one place the generic primitive is not enough: the
+SVF must re-apply #stability_clamp to the *snapped* active `f` as well as
+to the new target, since the previous target may sit at a different
+damping.  So `begin_ramp` does the snap-and-delta by hand rather than
+calling `CoefRamp::begin_ramp`.
+
+    impl SvfKernel {
+        #[inline]
+        pub fn begin_ramp(&mut self, ft: f32, dt: f32, interval_recip: f32) {
+            let ft = stability_clamp(ft, dt);
+            let prev_f = self.targets.target[F];
+            let prev_q = self.targets.target[Q];
+            self.coefs.active[F] = stability_clamp(prev_f, prev_q);
+            self.coefs.active[Q] = prev_q;
+            self.targets.target = [ft, dt];
+            self.coefs.delta[F] = (ft - self.coefs.active[F]) * interval_recip;
+            self.coefs.delta[Q] = (dt - self.coefs.active[Q]) * interval_recip;
         }
     }
 
@@ -195,6 +234,13 @@ After a `reset_state` the filter is silent again: zero in, zero out.
 
 ~example
     { let mut k = SvfKernel::from_coeffs(SvfCoeffs::new(1000.0, 48000.0, 0.5)); for _ in 0..100 { k.tick(1.0); } k.reset_state(); let (lp, hp, bp) = k.tick(0.0); lp == 0.0 && hp == 0.0 && bp == 0.0 }
+
+A `begin_ramp` to a new frequency coefficient does not jump there: over
+the next update interval the active `f` slides to its target, one delta
+per `tick`, arriving after exactly the interval's worth of samples.
+
+~example
+    { let mut k = SvfKernel::new_static(0.05, 0.5); k.begin_ramp(0.20, 0.5, 1.0 / 64.0); for _ in 0..64 { k.tick(0.0); } (k.coefs.active[0] - 0.20).abs() < 1e-3 }
 
 Across the whole parameter space — any cutoff, any resonance, any bounded
 input — the filter never escapes to a non-finite value.  Stability
@@ -226,10 +272,8 @@ structure-of-arrays layout — sixteen `f`s contiguous, then sixteen
 SIMD instruction per arithmetic step.  This is where the ramping
 machinery from #Patches Coef Ramp earns its keep: #PolySvfKernel holds a
 `PolyCoefRamp<2, 16>` for its two coefficients across sixteen voices,
-plus per-voice integrator state and a cold target array.
-
-    const F: usize = 0;
-    const Q: usize = 1;
+plus per-voice integrator state and a cold target array.  The `F` and `Q`
+coefficient indices are the same ones the single-voice kernel uses.
 
     pub struct PolySvfKernel {
         pub coefs: PolyCoefRamp<2, 16>,
