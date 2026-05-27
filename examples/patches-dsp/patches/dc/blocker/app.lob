@@ -1,0 +1,28 @@
+#Patches Dc Blocker App
+
+The executable entry point for the DC-blocker demonstration.  It feeds a
+signal with a baked-in +0.5 DC offset through a #Patches Dc Blocker and
+prints the first few outputs alongside a late output, showing the offset
+decaying away while the alternating component survives.
+
+    fn main() {
+        let mut dc = DcBlocker::new(44_100.0);
+        let offset = 0.5_f32;
+        for n in 0..8 {
+            let ac = if n % 2 == 0 { 0.2 } else { -0.2 };
+            let y = dc.process(offset + ac);
+            println!("n={n}  in={:+.3}  out={:+.3}", offset + ac, y);
+        }
+        // Run a while, then show the settled output for the same input.
+        for _ in 0..44_100 {
+            dc.process(offset + 0.2);
+        }
+        let settled = dc.process(offset + 0.2);
+        println!("settled out for in={:+.3}: {:+.5}", offset + 0.2, settled);
+    }
+
+---
+
+#References
+    #Patches Dc Blocker
+    #Patches Denormal

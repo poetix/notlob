@@ -1,0 +1,59 @@
+#Patches Denormal
+
+Subnormal floats — values smaller in magnitude than the smallest normal
+`f32` (~1.18e-38) — are a performance hazard in audio DSP.  A filter
+with a feedback path can settle into subnormal territory during long
+stretches of silence; on x86 each subnormal operation triggers a
+microcode trap costing tens of cycles.  The audible effect is nil
+(~-700 dBFS) but CPU rises during silence, exactly when headroom should
+be greatest.
+
+The fix is to flush subnormals to zero.  #flush_denormal returns its
+argument unchanged when it is a normal float (or already zero), and zero
+otherwise.  This is the scalar fallback; production audio code also sets
+the hardware flush-to-zero bit per callback, but the scalar guard is
+what the feedback kernels reach for inline.
+
+    pub fn flush_denormal(x: f32) -> f32 {
+        if !x.is_normal() && x != 0.0 {
+            0.0
+        } else {
+            x
+        }
+    }
+
+A normal value passes through untouched; a subnormal collapses to zero.
+
+~example
+    flush_denormal(1.0) == 1.0
+    flush_denormal(0.0) == 0.0
+    flush_denormal(-2.5) == -2.5
+    flush_denormal(1.0e-40) == 0.0
+
+##Closure under flushing
+
+Whatever the input — normal, subnormal, zero, infinity, or NaN — the
+result is always either exactly zero or a normal float.  The output set
+is closed: feeding any output back through #flush_denormal leaves it
+unchanged.
+
+~property closed-under-flush
+    proptest! {
+        fn closed(x in proptest::num::f32::ANY) {
+            let y = flush_denormal(x);
+            prop_assert!(y == 0.0 || y.is_normal());
+            prop_assert_eq!(flush_denormal(y), y);
+        }
+    }
+
+---
+
+#Tests
+
+##normal values pass through
+    flush_denormal(0.5) == 0.5
+    flush_denormal(-1.0e30) == -1.0e30
+
+##non-normal values flush to zero
+    flush_denormal(1.0e-40) == 0.0
+    flush_denormal(f32::MIN_POSITIVE / 2.0) == 0.0

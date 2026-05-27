@@ -53,6 +53,12 @@ def _get_binding_kit(language: str | None):
             extract_symbols as _hs_extract,
         )
         return _hs_kit, _hs_extract
+    if language == "rust":
+        from notlob.bindings.rust import (       # lazy: avoids import if unused
+            kit as _rs_kit,
+            extract_symbols as _rs_extract,
+        )
+        return _rs_kit, _rs_extract
     # default — python
     return _py_kit, _py_extract
 
@@ -247,6 +253,49 @@ def _cmd_run_haskell(
     return 0
 
 
+def _cmd_run_rust(
+    module,
+    path: Path,
+    keep_dir: Path | None = None,
+) -> int:
+    """Assemble a Rust module (with inlined deps) and run it via cargo.
+
+    The assembled source must define ``fn main``.  A missing ``main``
+    surfaces as a rustc error (non-zero exit) with the compiler message
+    on stderr.
+
+    If *keep_dir* is set the assembled source is also written there as
+    ``<module-address-slugified>.rs`` before execution.
+    """
+    from notlob.bindings.rust.assemble import assemble_with_deps
+    from notlob.bindings.rust.runner import (
+        _ALLOW, _load_dep_modules, _run_harness,
+    )
+
+    dep_modules = _load_dep_modules(module, path)
+    body        = assemble_with_deps(module, dep_modules)
+    if not body:
+        print("ERROR  <assembly>  module contains no code", file=sys.stderr)
+        return 1
+    source = f"{_ALLOW}\n\n{body}\n"
+
+    if keep_dir is not None:
+        from notlob.graph import module_address as _mod_addr
+        slug = _mod_addr(module.title).replace("/", "_")
+        keep_path = keep_dir / f"{slug}.rs"
+    else:
+        keep_path = None
+
+    stdout, stderr, rc = _run_harness(source, keep_path=keep_path)
+    if stdout:
+        print(stdout, end="")
+    if rc != 0:
+        if stderr:
+            print(stderr, end="", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_run(path: Path, keep_generated_src: str | None = None) -> int:
     """Assemble and execute *path*; return an exit code."""
     try:
@@ -262,6 +311,10 @@ def cmd_run(path: Path, keep_generated_src: str | None = None) -> int:
     if language == "haskell":
         keep_dir = _resolve_keep_dir(keep_generated_src, binding, root)
         return _cmd_run_haskell(module, path, keep_dir=keep_dir)
+
+    if language == "rust":
+        keep_dir = _resolve_keep_dir(keep_generated_src, binding, root)
+        return _cmd_run_rust(module, path, keep_dir=keep_dir)
 
     root = find_project_root(path)
 
@@ -304,7 +357,11 @@ def cmd_test(path: Path, keep_generated_src: str | None = None) -> int:
     root     = find_project_root(path)
     language = binding.get("language")
     kit, extract_symbols = _get_binding_kit(language)
-    cache    = ModuleCache(root) if (root and language != "haskell") else None
+    cache    = (
+        ModuleCache(root)
+        if (root and language not in ("haskell", "rust"))
+        else None
+    )
     keep_dir = _resolve_keep_dir(keep_generated_src, binding, root)
 
     doc_errors: list[str] = []

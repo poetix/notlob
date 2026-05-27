@@ -1,0 +1,110 @@
+#Patches Dc Blocker
+
+A DC blocker removes a constant or slowly-drifting offset from a signal
+while leaving the audible band essentially untouched.  Such offsets
+creep in after waveshaping, bias injection, or any nonlinearity that is
+not perfectly symmetric; left in place they waste headroom and can thump
+through downstream filters.
+
+The kernel is a one-pole highpass with its corner placed around 5 Hz —
+below hearing, above DC:
+
+```text
+y[n] = x[n] - x[n-1] + R * y[n-1]
+R = 1 - 2*pi*fc / sample_rate
+```
+
+The pole radius `R` sits just inside the unit circle, so the feedback
+term `R * y[n-1]` decays slowly.  During silence that decaying tail is
+exactly the kind of value that drifts subnormal, so each output is
+passed through #Patches Denormal's `flush_denormal` before it is stored
+as state.
+
+    #[derive(Clone)]
+    pub struct DcBlocker {
+        x_prev: f32,
+        y_prev: f32,
+        r: f32,
+    }
+
+    impl DcBlocker {
+        pub fn new(sample_rate: f32) -> Self {
+            Self {
+                x_prev: 0.0,
+                y_prev: 0.0,
+                r: 1.0 - TAU * 5.0 / sample_rate,
+            }
+        }
+
+        #[inline]
+        pub fn process(&mut self, x: f32) -> f32 {
+            let y = flush_denormal(x - self.x_prev + self.r * self.y_prev);
+            self.x_prev = x;
+            self.y_prev = y;
+            y
+        }
+
+        pub fn reset(&mut self) {
+            self.x_prev = 0.0;
+            self.y_prev = 0.0;
+        }
+    }
+
+Fed a constant input, the output settles toward zero — the offset is
+removed.  After a #reset the filter behaves as freshly constructed:
+silence in, silence out.
+
+~example
+    { let mut dc = DcBlocker::new(44100.0); for _ in 0..44100 { dc.process(1.0); } dc.process(1.0).abs() < 0.01 }
+    { let mut dc = DcBlocker::new(44100.0); dc.process(1.0); dc.process(1.0); dc.reset(); dc.process(0.0) == 0.0 }
+
+##Stability and silence
+
+The filter is stable: a bounded input yields a bounded output, and a
+long run of any constant input never escapes to a non-finite value.
+
+~property bounded-output
+    proptest! {
+        fn finite_under_constant_drive(x in -1.0f32..1.0) {
+            let mut dc = DcBlocker::new(44100.0);
+            let mut out = 0.0f32;
+            for _ in 0..2000 {
+                out = dc.process(x);
+            }
+            prop_assert!(out.is_finite());
+        }
+    }
+
+Prolonged silence after an impulse must not produce subnormal stalls —
+the #flush_denormal guard guarantees every stored output is zero or
+normal.
+
+~property silence-has-no-denormals
+    proptest! {
+        fn silence_is_clean(seed in -1.0f32..1.0) {
+            let mut dc = DcBlocker::new(44100.0);
+            dc.process(seed);
+            let mut out = 0.0f32;
+            for _ in 0..10000 {
+                out = dc.process(0.0);
+            }
+            prop_assert!(out == 0.0 || out.is_normal());
+        }
+    }
+
+---
+
+#Tests
+
+##removes a constant offset
+    { let mut dc = DcBlocker::new(44100.0); for _ in 0..44100 { dc.process(1.0); } dc.process(1.0).abs() < 0.01 }
+
+##passes an alternating signal
+    { let mut dc = DcBlocker::new(44100.0); for _ in 0..4410 { dc.process(0.5); dc.process(-0.5); } dc.process(0.5).abs() > 0.1 }
+
+##reset clears state
+    { let mut dc = DcBlocker::new(44100.0); dc.process(1.0); dc.process(1.0); dc.reset(); dc.process(0.0) == 0.0 }
+
+#References
+    #Patches Denormal
+    use std::f32::consts::TAU;

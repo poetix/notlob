@@ -1,0 +1,14 @@
+#Patches
+
+A notlob project demonstrating the Rust binding by converting a slice of
+the `patches-dsp` audio kernel library into literate form.  Three
+modules are included: a denormal-flushing primitive, time-domain
+utilities, and a DC-blocking highpass filter that depends on the
+denormal primitive — exercising cross-module `#References` resolution
+under the Rust binding.
+
+---
+
+#Binding
+    ~language rust
+    ~property-testing proptest
