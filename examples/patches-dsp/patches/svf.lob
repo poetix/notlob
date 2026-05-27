@@ -1,0 +1,246 @@
+#Patches Svf
+
+The Chamberlin state-variable filter (SVF) is the workhorse of digital
+synthesis: from a single input sample it produces lowpass, highpass, and
+bandpass outputs *simultaneously*, and its cutoff and resonance map onto
+two coefficients that are cheap to compute and pleasant to modulate.  The
+whole filter is three lines of arithmetic over two state variables:
+
+```text
+lp = lp + f * bp          (lowpass integrator)
+hp = x - lp - q_damp * bp  (highpass = input minus the rest)
+bp = bp + f * hp          (bandpass integrator)
+```
+
+`f` is a frequency coefficient rising with cutoff; `q_damp` is a *damping*
+coefficient that *falls* as resonance rises.  Two integrators, fed back
+through the highpass node, realise a second-order resonant filter.
+
+This module presents the kernel in its static form — fixed coefficients
+per note.  Production use layers per-sample coefficient interpolation on
+top (smooth CV modulation without zipper noise); that ramping is an
+orthogonal concern and is omitted here so the filter itself is in view.
+
+##Coefficients
+
+Cutoff in Hz becomes the frequency coefficient through
+`f = 2·sin(π·fc/fs)`.  The cutoff is clamped to `[1, 0.499·fs]`: below
+1 Hz is pointless, and at Nyquist (`0.5·fs`) the `sin` argument reaches
+`π/2` where the small-angle approximation underpinning the topology
+breaks down.
+
+    pub fn svf_f(cutoff_hz: f32, sample_rate: f32) -> f32 {
+        let fc = cutoff_hz.clamp(1.0, sample_rate * 0.499);
+        2.0 * (PI * fc / sample_rate).sin()
+    }
+
+Resonance is authored as a normalised `q` in `[0, 1]` and mapped to the
+damping coefficient by an exponential curve.  Damping and resonance run
+in *opposite* directions: high damping (`q_damp = 2`) means no resonant
+peak; low damping (`q_damp = 0.01`) means self-oscillation.  The
+exponential `2·0.005^q` spreads the musically useful range smoothly
+across the knob.
+
+    pub fn q_to_damp(q: f32) -> f32 {
+        2.0 * (0.005_f32).powf(q)
+    }
+
+~example
+    (svf_f(1000.0, 48000.0) - 0.1306).abs() < 1.0e-3
+    svf_f(1.0, 48000.0) > 0.0
+    q_to_damp(0.0) == 2.0
+    (q_to_damp(1.0) - 0.01).abs() < 1.0e-5
+
+The damping curve is monotone: more resonance knob, less damping, every
+time.
+
+~property damping-monotone
+    proptest! {
+        fn monotone(a in 0.0f32..1.0, b in 0.0f32..1.0) {
+            prop_assume!(a < b);
+            prop_assert!(q_to_damp(a) >= q_to_damp(b));
+        }
+    }
+
+##Stability
+
+The Chamberlin topology is only conditionally stable.  Its characteristic
+polynomial is `λ² − (2 − f² − f·d)λ + (1 − f·d)`.  Applying the Jury test
+to a monic quadratic `λ² + a₁λ + a₀`, with `a₁ = f² + fd − 2` and
+`a₀ = 1 − fd`, both roots stay inside the unit circle exactly when
+`f² + 2·f·d < 4` (together with `fd < 2`).  Solving the boundary
+`f² + 2fd = 4` for `f` gives `f < −d + √(d² + 4)`.
+
+The `stability_clamp` function enforces this, holding `f` a small margin
+(0.05) below the boundary — right at the edge the transient gain is large
+enough to overflow `f32` before the filter settles.
+
+    pub fn stability_clamp(f: f32, d: f32) -> f32 {
+        let f_max = (-d + (d * d + 4.0).sqrt()) - 0.05;
+        f.min(f_max)
+    }
+
+> **Correction note.**  The `patches-dsp` source this module is derived
+> from solves `f² + fd = 4` here (`f_max = ½(−d + √(d² + 16))`), a looser
+> bound that lets `f` cross the real stability edge — at `q = 0` a DC
+> input near 8.8 kHz diverges.  The `clamp-is-stable` property below
+> caught the discrepancy; the formula above is the corrected bound.
+
+~example
+    (stability_clamp(2.0, 2.0) - 0.778).abs() < 1.0e-2
+    stability_clamp(0.1, 0.01) == 0.1
+
+Whatever frequency coefficient and damping are thrown at it, the clamped
+result lands strictly inside the stable region.
+
+~property clamp-is-stable
+    proptest! {
+        fn clamped_is_stable(f in 0.0f32..20.0, q in 0.0f32..1.0) {
+            let d = q_to_damp(q);
+            let fc = stability_clamp(f, d);
+            prop_assert!(fc * fc + 2.0 * fc * d < 4.0);
+        }
+    }
+
+##The kernel
+
+A bad input sample (NaN or ±∞ arriving from upstream) must not be able to
+poison the integrators permanently, so each state write passes through
+the `sanitize` helper, which replaces any non-finite value with zero.
+
+    fn sanitize(v: f32) -> f32 {
+        if v.is_finite() { v } else { 0.0 }
+    }
+
+The `SvfCoeffs` struct is the frozen coefficient pair; `SvfState` is the
+two-word integrator memory.
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct SvfCoeffs {
+        pub f: f32,
+        pub q_damp: f32,
+    }
+
+    impl SvfCoeffs {
+        pub fn new(cutoff_hz: f32, sample_rate: f32, q_norm: f32) -> Self {
+            Self {
+                f: svf_f(cutoff_hz, sample_rate),
+                q_damp: q_to_damp(q_norm),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct SvfState {
+        pub lp: f32,
+        pub bp: f32,
+    }
+
+    impl SvfState {
+        pub fn reset(&mut self) {
+            self.lp = 0.0;
+            self.bp = 0.0;
+        }
+    }
+
+The #SvfKernel type binds coefficients and state.  Construction runs the
+coefficients through `stability_clamp` once; each `tick` then evaluates
+the three-line recurrence and returns `(lp, hp, bp)`.
+
+    pub struct SvfKernel {
+        pub coeffs: SvfCoeffs,
+        pub state: SvfState,
+    }
+
+    impl SvfKernel {
+        pub fn new_static(f: f32, d: f32) -> Self {
+            let f = stability_clamp(f, d);
+            Self {
+                coeffs: SvfCoeffs { f, q_damp: d },
+                state: SvfState::default(),
+            }
+        }
+
+        pub fn from_coeffs(c: SvfCoeffs) -> Self {
+            Self::new_static(c.f, c.q_damp)
+        }
+
+        pub fn reset_state(&mut self) {
+            self.state.reset();
+        }
+
+        #[inline]
+        pub fn tick(&mut self, x: f32) -> (f32, f32, f32) {
+            let f = self.coeffs.f;
+            let q = self.coeffs.q_damp;
+            let lp = self.state.lp + f * self.state.bp;
+            let hp = x - lp - q * self.state.bp;
+            let bp = self.state.bp + f * hp;
+            self.state.lp = sanitize(lp);
+            self.state.bp = sanitize(bp);
+            (lp, hp, bp)
+        }
+    }
+
+Fed a constant (a DC input), the lowpass output settles to that constant:
+the SVF lowpass has unity gain at DC.  Fed the same constant, the
+highpass and bandpass outputs settle to zero — DC is exactly what they
+reject.
+
+~example
+    { let mut k = SvfKernel::from_coeffs(SvfCoeffs::new(1000.0, 48000.0, 0.3)); let mut lp = 0.0; for _ in 0..5000 { lp = k.tick(1.0).0; } (lp - 1.0).abs() < 0.01 }
+    { let mut k = SvfKernel::from_coeffs(SvfCoeffs::new(1000.0, 48000.0, 0.3)); let mut hp = 1.0; for _ in 0..5000 { hp = k.tick(1.0).1; } hp.abs() < 0.01 }
+
+After a `reset_state` the filter is silent again: zero in, zero out.
+
+~example
+    { let mut k = SvfKernel::from_coeffs(SvfCoeffs::new(1000.0, 48000.0, 0.5)); for _ in 0..100 { k.tick(1.0); } k.reset_state(); let (lp, hp, bp) = k.tick(0.0); lp == 0.0 && hp == 0.0 && bp == 0.0 }
+
+Across the whole parameter space — any cutoff, any resonance, any bounded
+input — the filter never escapes to a non-finite value.  Stability
+clamping bounds the poles; the `sanitize` helper scrubs anything that
+slips through.
+
+~property bounded-input-bounded-output
+    proptest! {
+        fn bibo(
+            cutoff in 20.0f32..12000.0,
+            q in 0.0f32..1.0,
+            x in -1.0f32..1.0,
+        ) {
+            let mut k = SvfKernel::from_coeffs(SvfCoeffs::new(cutoff, 48000.0, q));
+            let mut out = (0.0f32, 0.0f32, 0.0f32);
+            for _ in 0..4000 {
+                out = k.tick(x);
+            }
+            prop_assert!(out.0.is_finite() && out.1.is_finite() && out.2.is_finite());
+        }
+    }
+
+---
+
+#Tests
+
+##coefficient mapping
+    (svf_f(1000.0, 48000.0) - 0.1306).abs() < 1.0e-3
+    svf_f(20000.0, 48000.0) <= svf_f(48000.0 * 0.499, 48000.0)
+    q_to_damp(0.0) == 2.0
+    q_to_damp(0.0) > q_to_damp(0.5)
+    q_to_damp(0.5) > q_to_damp(1.0)
+
+##stability clamp
+    stability_clamp(0.1, 0.01) == 0.1
+    stability_clamp(100.0, 0.01) < 2.0
+    { let f = stability_clamp(5.0, q_to_damp(1.0)); f * f + 2.0 * f * q_to_damp(1.0) < 4.0 }
+
+##lowpass DC gain is unity
+    { let mut k = SvfKernel::from_coeffs(SvfCoeffs::new(800.0, 44100.0, 0.2)); let mut lp = 0.0; for _ in 0..8000 { lp = k.tick(1.0).0; } (lp - 1.0).abs() < 0.01 }
+
+##highpass and bandpass reject DC
+    { let mut k = SvfKernel::from_coeffs(SvfCoeffs::new(800.0, 44100.0, 0.2)); let mut o = (0.0, 1.0, 1.0); for _ in 0..8000 { o = k.tick(1.0); } o.1.abs() < 0.01 && o.2.abs() < 0.01 }
+
+##a non-finite input cannot poison the state
+    { let mut k = SvfKernel::from_coeffs(SvfCoeffs::new(800.0, 44100.0, 0.5)); k.tick(f32::NAN); let (lp, _, bp) = k.tick(0.0); lp.is_finite() && bp.is_finite() }
+
+#References
+    use std::f32::consts::PI;
